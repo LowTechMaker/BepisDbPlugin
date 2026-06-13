@@ -18,7 +18,11 @@ internal static partial class BepisDbFilenameParser
         var prefix = match.Groups[1].Value;
         if (BepisDbCategoryHelper.TryFromPrefix(prefix) is null) return null;
 
-        return new ArtworkId(ProviderId, match.Groups[0].Value);
+        // Strip leading zeros: KKSCENE_078928 → KKSCENE_78928
+        var numericId = match.Groups[2].Value.TrimStart('0');
+        if (numericId.Length == 0) numericId = "0";
+
+        return new ArtworkId(ProviderId, $"{prefix}_{numericId}");
     }
 
     public static ArtworkId? TryParseFolder(string folderName)
