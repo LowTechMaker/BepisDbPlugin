@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>SceneGallery.Plugin.BepisDb</RootNamespace>
     <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <SceneGalleryAppDir Condition="'$(SceneGalleryAppDir)' == ''">$(MSBuildThisFileDirectory)..\KoikatsuSceneGallery</SceneGalleryAppDir>
   </PropertyGroup>
 
