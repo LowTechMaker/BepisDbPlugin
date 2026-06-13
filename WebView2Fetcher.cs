@@ -1,9 +1,11 @@
+using System.Text.Json;
 using Microsoft.Web.WebView2.Core;
 
 namespace SceneGallery.Plugin.BepisDb;
 
 internal sealed class WebView2Fetcher : IBepisDbFetcher
 {
+    private const string ApiBase = "https://db.bepis.moe/api/frontend/cardPage";
     private static readonly TimeSpan NavigationTimeout = TimeSpan.FromSeconds(30);
 
     private readonly RateLimiter _rateLimiter;
@@ -61,9 +63,10 @@ internal sealed class WebView2Fetcher : IBepisDbFetcher
         }
     }
 
-    public async Task<string?> FetchPageHtmlAsync(string url, CancellationToken ct)
+    public async Task<BepisDbCardData?> FetchCardAsync(string cardType, string numericId, CancellationToken ct)
     {
         using var lease = await _rateLimiter.AcquireAsync(ct).ConfigureAwait(false);
+        var url = $"{ApiBase}?cardType={cardType}&id={numericId}";
 
         try
         {
@@ -94,18 +97,14 @@ internal sealed class WebView2Fetcher : IBepisDbFetcher
                 {
                     try
                     {
-                        // Wait briefly for any JS to finish rendering
-                        await Task.Delay(2000, ct).ConfigureAwait(false);
-                        var html = await _webView.ExecuteScriptAsync(
-                            "document.documentElement.outerHTML").ConfigureAwait(false);
+                        var bodyJson = await _webView.ExecuteScriptAsync(
+                            "document.body.innerText").ConfigureAwait(false);
 
                         // ExecuteScriptAsync returns a JSON-encoded string
-                        if (html is not null && html.StartsWith('"') && html.EndsWith('"'))
-                        {
-                            html = System.Text.Json.JsonSerializer.Deserialize<string>(html);
-                        }
+                        if (bodyJson is not null)
+                            bodyJson = JsonSerializer.Deserialize<string>(bodyJson);
 
-                        tcs.TrySetResult(html);
+                        tcs.TrySetResult(bodyJson);
                     }
                     catch (Exception ex)
                     {
@@ -119,7 +118,18 @@ internal sealed class WebView2Fetcher : IBepisDbFetcher
             try
             {
                 _webView.Navigate(url);
-                return await tcs.Task.ConfigureAwait(false);
+                var json = await tcs.Task.ConfigureAwait(false);
+
+                if (json is null) return null;
+
+                var apiResponse = JsonSerializer.Deserialize<BepisDbApiResponse>(json);
+                if (apiResponse?.Type != "success" || apiResponse.Data?.Card is null)
+                {
+                    _log($"BepisDB API returned unexpected response for {cardType}_{numericId}: {apiResponse?.Error ?? "no card data"}");
+                    return null;
+                }
+
+                return apiResponse.Data.Card;
             }
             finally
             {
@@ -132,7 +142,7 @@ internal sealed class WebView2Fetcher : IBepisDbFetcher
         }
         catch (Exception ex)
         {
-            _log($"WebView2 fetch failed for {url}: {ex.Message}");
+            _log($"WebView2 fetch failed for {cardType}_{numericId}: {ex.Message}");
             return null;
         }
     }

@@ -2,5 +2,5 @@ namespace SceneGallery.Plugin.BepisDb;
 
 internal interface IBepisDbFetcher : IDisposable
 {
-    Task<string?> FetchPageHtmlAsync(string url, CancellationToken ct);
+    Task<BepisDbCardData?> FetchCardAsync(string cardType, string numericId, CancellationToken ct);
 }

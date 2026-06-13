@@ -11,7 +11,6 @@ public sealed class BepisDbPlugin : ICardImportProvider, IDisposable
     private IPluginHost? _host;
     private IBepisDbFetcher? _fetcher;
     private ArtworkDiskCache? _artworkCache;
-    private PluginSettings? _settings;
 
     private readonly ConcurrentDictionary<string, Lazy<Task<ArtworkInfo?>>> _artworkInFlight = new();
     private readonly ConcurrentDictionary<string, ArtworkDiskCache.CachedArtwork> _unsavedArtworkDetails = new();
@@ -26,11 +25,11 @@ public sealed class BepisDbPlugin : ICardImportProvider, IDisposable
     {
         _host = host;
         _artworkCache = new ArtworkDiskCache(host.StorageDirectory, host.Log);
-        _settings = PluginSettings.Load(host.StorageDirectory, host.Log);
+        var settings = PluginSettings.Load(host.StorageDirectory, host.Log);
 
         var rateLimiter = new RateLimiter(MinRequestInterval, MaxJitter);
 
-        if (_settings.FetchStrategy.Equals("webview2", StringComparison.OrdinalIgnoreCase))
+        if (settings.FetchStrategy.Equals("webview2", StringComparison.OrdinalIgnoreCase))
         {
             if (WebView2Fetcher.IsAvailable())
             {
@@ -41,18 +40,18 @@ public sealed class BepisDbPlugin : ICardImportProvider, IDisposable
             {
                 host.Log("BepisDB: WebView2 runtime not found. Install the WebView2 Evergreen Runtime, " +
                          "or set fetchStrategy to \"cookie\" in settings.json. Falling back to cookie mode.");
-                _fetcher = new CookieHttpFetcher(_settings, rateLimiter, host.Log);
+                _fetcher = new CookieHttpFetcher(settings, rateLimiter, host.Log);
             }
         }
         else
         {
-            if (string.IsNullOrEmpty(_settings.CfClearanceCookie))
+            if (string.IsNullOrEmpty(settings.CfClearanceCookie))
             {
                 host.Log("BepisDB: cookie strategy selected but no cf_clearance cookie configured. " +
                          "Edit settings.json in the plugin storage directory to add your cookie. " +
                          "Fetch requests will likely fail with 403.");
             }
-            _fetcher = new CookieHttpFetcher(_settings, rateLimiter, host.Log);
+            _fetcher = new CookieHttpFetcher(settings, rateLimiter, host.Log);
         }
     }
 
@@ -99,44 +98,38 @@ public sealed class BepisDbPlugin : ICardImportProvider, IDisposable
     {
         try
         {
-            var url = GetArtworkUrl(id);
-            var html = await _fetcher!.FetchPageHtmlAsync(url, ct).ConfigureAwait(false);
-
-            if (html is null)
-            {
-                if (saveToLocalCache)
-                {
-                    _artworkCache!.Set(id.Id, new ArtworkDiskCache.CachedArtwork(
-                        null, null, null, null, null, null, DateTimeOffset.UtcNow, Failed: true));
-                }
-                return null;
-            }
-
-            var data = BepisDbHtmlParser.Parse(html, _host!.Log);
-            if (data is null)
-            {
-                if (saveToLocalCache)
-                {
-                    _artworkCache!.Set(id.Id, new ArtworkDiskCache.CachedArtwork(
-                        null, null, null, null, null, null, DateTimeOffset.UtcNow, Failed: true));
-                }
-                return null;
-            }
-
             var parsed = BepisDbCategoryHelper.ParseCompositeId(id.Id);
-            var category = parsed?.Category.ToUrlSegment();
+            if (parsed is null)
+            {
+                _host?.Log($"Cannot parse composite ID: {id.Id}");
+                return null;
+            }
 
-            var tags = data.Value.Tags
-                .Select(t => new ArtworkDiskCache.CachedTag(t))
+            var card = await _fetcher!.FetchCardAsync(
+                parsed.Value.Category.ToCardType(), parsed.Value.NumericId, ct).ConfigureAwait(false);
+
+            if (card is null)
+            {
+                if (saveToLocalCache)
+                {
+                    _artworkCache!.Set(id.Id, new ArtworkDiskCache.CachedArtwork(
+                        null, null, null, null, null, 0, DateTimeOffset.UtcNow, Failed: true));
+                }
+                return null;
+            }
+
+            var tags = card.Tags?
+                .Where(t => t.Name is not null)
+                .Select(t => new ArtworkDiskCache.CachedTag(t.Name!))
                 .ToList();
 
             var entry = new ArtworkDiskCache.CachedArtwork(
-                data.Value.UploaderName,
-                data.Value.UploaderId,
-                data.Value.Title,
-                data.Value.Description,
-                category,
+                card.Uploader?.Username,
+                card.Uploader?.Id.ToString(),
+                card.CustomName,
+                card.CardType,
                 tags,
+                card.DownloadCount,
                 DateTimeOffset.UtcNow,
                 Failed: false);
 
@@ -184,7 +177,7 @@ public sealed class BepisDbPlugin : ICardImportProvider, IDisposable
             entry.UploaderName ?? "Unknown",
             entry.UploaderId ?? "0",
             entry.Title,
-            entry.Description,
+            null,
             ContentRating.AllAges,
             tags,
             entry.FetchedAt,

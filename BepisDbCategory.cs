@@ -25,6 +25,14 @@ internal static class BepisDbCategoryHelper
         _ => throw new ArgumentOutOfRangeException(nameof(category)),
     };
 
+    public static string ToCardType(this BepisDbCategory category) => category switch
+    {
+        BepisDbCategory.KkScene => "KKSCENE",
+        BepisDbCategory.KkClothing => "KKCLOTHING",
+        BepisDbCategory.Koikatsu => "KK",
+        _ => throw new ArgumentOutOfRangeException(nameof(category)),
+    };
+
     public static (BepisDbCategory Category, string NumericId)? ParseCompositeId(string compositeId)
     {
         var underscoreIndex = compositeId.LastIndexOf('_');

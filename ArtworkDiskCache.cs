@@ -10,9 +10,9 @@ internal sealed class ArtworkDiskCache : IDisposable
         string? UploaderName,
         string? UploaderId,
         string? Title,
-        string? Description,
-        string? Category,
+        string? CardType,
         IReadOnlyList<CachedTag>? Tags,
+        int DownloadCount,
         DateTimeOffset FetchedAt,
         bool Failed);
 

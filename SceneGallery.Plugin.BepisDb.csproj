@@ -19,7 +19,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="AngleSharp" Version="1.*" ExcludeAssets="runtime" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.*" />
   </ItemGroup>
 

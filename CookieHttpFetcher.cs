@@ -1,9 +1,12 @@
 using System.Net;
+using System.Text.Json;
 
 namespace SceneGallery.Plugin.BepisDb;
 
 internal sealed class CookieHttpFetcher : IBepisDbFetcher
 {
+    private const string ApiBase = "https://db.bepis.moe/api/frontend/cardPage";
+
     private readonly HttpClient _http;
     private readonly RateLimiter _rateLimiter;
     private readonly Action<string> _log;
@@ -33,21 +36,23 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
         var userAgent = settings.UserAgent
             ?? "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
         _http.DefaultRequestHeaders.Add("User-Agent", userAgent);
-        _http.DefaultRequestHeaders.Add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+        _http.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
         _http.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
         _http.DefaultRequestHeaders.Add("Referer", "https://db.bepis.moe/");
     }
 
-    public async Task<string?> FetchPageHtmlAsync(string url, CancellationToken ct)
+    public async Task<BepisDbCardData?> FetchCardAsync(string cardType, string numericId, CancellationToken ct)
     {
         using var lease = await _rateLimiter.AcquireAsync(ct).ConfigureAwait(false);
+        var url = $"{ApiBase}?cardType={cardType}&id={numericId}";
+
         try
         {
             var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
 
             if (response.StatusCode == HttpStatusCode.Forbidden)
             {
-                _log("BepisDB returned 403 Forbidden. Your cf_clearance cookie may have expired. " +
+                _log("BepisDB API returned 403 Forbidden. Your cf_clearance cookie may have expired. " +
                      "Update settings.json with a fresh cookie from your browser, or switch to webview2 strategy.");
                 return null;
             }
@@ -56,7 +61,17 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
                 return null;
 
             response.EnsureSuccessStatusCode();
-            return await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+            var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var apiResponse = JsonSerializer.Deserialize<BepisDbApiResponse>(json);
+
+            if (apiResponse?.Type != "success" || apiResponse.Data?.Card is null)
+            {
+                _log($"BepisDB API returned unexpected response for {cardType}_{numericId}: {apiResponse?.Error ?? "no card data"}");
+                return null;
+            }
+
+            return apiResponse.Data.Card;
         }
         catch (OperationCanceledException)
         {
@@ -64,7 +79,7 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
         }
         catch (HttpRequestException ex)
         {
-            _log($"HTTP request failed for {url}: {ex.Message}");
+            _log($"BepisDB API request failed for {cardType}_{numericId}: {ex.Message}");
             return null;
         }
     }
