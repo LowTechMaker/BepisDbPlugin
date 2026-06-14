@@ -14,6 +14,7 @@ internal sealed class PluginSettings
 
     public string? CfClearanceCookie { get; set; }
     public string? UserAgent { get; set; }
+    public string DestinationFolderName { get; set; } = "BepisDB";
 
     public static PluginSettings Load(string storageDirectory, Action<string> log)
     {

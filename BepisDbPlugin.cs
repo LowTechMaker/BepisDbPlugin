@@ -6,7 +6,7 @@ using SceneGallery.PluginSdk;
 
 namespace SceneGallery.Plugin.BepisDb;
 
-public sealed class BepisDbPlugin : ICardImportProvider, IImportDestinationProvider, ICookieSetupValidator, IDisposable
+public sealed class BepisDbPlugin : ICardImportProvider, IImportDestinationProvider, ICookieSetupValidator, IPluginSettingsProvider, IDisposable
 {
     private static readonly TimeSpan MinRequestInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan MaxJitter = TimeSpan.FromSeconds(5);
@@ -27,9 +27,19 @@ public sealed class BepisDbPlugin : ICardImportProvider, IImportDestinationProvi
 
     public string ProviderId => BepisDbFilenameParser.ProviderId;
 
-    public string DestinationFolderName => "BepisDB";
+    public string DestinationFolderName => _settings?.DestinationFolderName ?? "BepisDB";
 
     public bool UsesRatingFolders => false;
+
+    public IReadOnlyList<PluginSettingDefinition> Settings { get; } =
+    [
+        new(
+            "destinationFolderName",
+            "Destination folder",
+            "Folder inserted below the organized import subfolder. Leave empty to skip the provider folder.",
+            PluginSettingValueType.Text,
+            "BepisDB"),
+    ];
 
     // ICookieSetupProvider
     public string SetupUrl => "https://db.bepis.moe/";
@@ -65,6 +75,27 @@ public sealed class BepisDbPlugin : ICardImportProvider, IImportDestinationProvi
             host.Log("BepisDB: no cf_clearance cookie configured. Use the cookie setup button on the import page.");
 
         _fetcher = CreateCookieFetcher();
+    }
+
+    public string? GetSettingValue(string key) => key switch
+    {
+        "destinationFolderName" => DestinationFolderName,
+        _ => null,
+    };
+
+    public void SetSettingValue(string key, string? value)
+    {
+        if (_host is null || _settings is null)
+            return;
+
+        switch (key)
+        {
+            case "destinationFolderName":
+                _settings.DestinationFolderName = value?.Trim() ?? "";
+                break;
+        }
+
+        _settings.Save(_host.StorageDirectory, _host.Log);
     }
 
     public async Task<bool> HasUsableCookiesAsync(CancellationToken ct)
