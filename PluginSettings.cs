@@ -12,7 +12,6 @@ internal sealed class PluginSettings
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
 
-    public string FetchStrategy { get; set; } = "webview2";
     public string? CfClearanceCookie { get; set; }
     public string? UserAgent { get; set; }
 

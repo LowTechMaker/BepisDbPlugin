@@ -22,6 +22,9 @@ internal sealed partial class WebView2Fetcher : IBepisDbFetcher
     private bool _challengePassed;
     private readonly SemaphoreSlim _initLock = new(1, 1);
 
+    private Windows.System.DispatcherQueueController? _dqController;
+    private Windows.System.DispatcherQueue? _dq;
+
     public WebView2Fetcher(string storageDirectory, RateLimiter rateLimiter, Action<string> log)
     {
         _rateLimiter = rateLimiter;
@@ -42,6 +45,47 @@ internal sealed partial class WebView2Fetcher : IBepisDbFetcher
         }
     }
 
+    private Task RunOnWebViewThread(Func<Task> asyncFunc)
+    {
+        var tcs = new TaskCompletionSource();
+        if (!_dq!.TryEnqueue(async () =>
+        {
+            try
+            {
+                await asyncFunc();
+                tcs.SetResult();
+            }
+            catch (Exception ex)
+            {
+                tcs.SetException(ex);
+            }
+        }))
+        {
+            tcs.SetException(new ObjectDisposedException(nameof(WebView2Fetcher), "DispatcherQueue is shut down."));
+        }
+        return tcs.Task;
+    }
+
+    private Task<T> RunOnWebViewThread<T>(Func<Task<T>> asyncFunc)
+    {
+        var tcs = new TaskCompletionSource<T>();
+        if (!_dq!.TryEnqueue(async () =>
+        {
+            try
+            {
+                tcs.SetResult(await asyncFunc());
+            }
+            catch (Exception ex)
+            {
+                tcs.SetException(ex);
+            }
+        }))
+        {
+            tcs.SetException(new ObjectDisposedException(nameof(WebView2Fetcher), "DispatcherQueue is shut down."));
+        }
+        return tcs.Task;
+    }
+
     private async Task EnsureInitializedAsync()
     {
         if (_initialized) return;
@@ -50,18 +94,24 @@ internal sealed partial class WebView2Fetcher : IBepisDbFetcher
         {
             if (_initialized) return;
 
-            _hwnd = CreateHostWindow(visible: false);
-            if (_hwnd == IntPtr.Zero)
-                throw new InvalidOperationException("Failed to create host window for WebView2.");
+            _dqController = Windows.System.DispatcherQueueController.CreateOnDedicatedThread();
+            _dq = _dqController.DispatcherQueue;
 
-            _environment = await CoreWebView2Environment.CreateAsync(
-                userDataFolder: _userDataFolder);
+            await RunOnWebViewThread(async () =>
+            {
+                _hwnd = CreateHostWindow(visible: false);
+                if (_hwnd == IntPtr.Zero)
+                    throw new InvalidOperationException("Failed to create host window for WebView2.");
 
-            _controller = await _environment.CreateCoreWebView2ControllerAsync(_hwnd);
-            _webView = _controller.CoreWebView2;
+                _environment = await CoreWebView2Environment.CreateAsync(
+                    userDataFolder: _userDataFolder);
 
-            _controller.Bounds = new System.Drawing.Rectangle(0, 0, 800, 600);
-            _controller.IsVisible = false;
+                _controller = await _environment.CreateCoreWebView2ControllerAsync(_hwnd);
+                _webView = _controller.CoreWebView2;
+
+                _controller.Bounds = new System.Drawing.Rectangle(0, 0, 800, 600);
+                _controller.IsVisible = false;
+            });
 
             _initialized = true;
             _log("WebView2 initialized successfully.");
@@ -93,20 +143,17 @@ internal sealed partial class WebView2Fetcher : IBepisDbFetcher
                 return null;
             }
 
-            // First attempt: try the API directly
-            var json = await NavigateAndExtractAsync(url, ct).ConfigureAwait(false);
+            var json = await RunOnWebViewThread(() => NavigateAndExtractAsync(url, ct)).ConfigureAwait(false);
 
-            // If we got a Cloudflare challenge instead of JSON, show the window
-            // so the user can complete the captcha
             if (json is null && !_challengePassed)
             {
                 _log("Cloudflare challenge detected. Opening browser for captcha...");
-                var passed = await ShowChallengeWindowAsync(ct).ConfigureAwait(false);
+                var passed = await RunOnWebViewThread(() => ShowChallengeWindowAsync(ct)).ConfigureAwait(false);
                 if (passed)
                 {
                     _challengePassed = true;
                     _log("Cloudflare challenge passed. Retrying API call...");
-                    json = await NavigateAndExtractAsync(url, ct).ConfigureAwait(false);
+                    json = await RunOnWebViewThread(() => NavigateAndExtractAsync(url, ct)).ConfigureAwait(false);
                 }
                 else
                 {
@@ -153,35 +200,14 @@ internal sealed partial class WebView2Fetcher : IBepisDbFetcher
                 return;
             }
 
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    var bodyJson = await _webView!.ExecuteScriptAsync(
-                        "document.body.innerText").ConfigureAwait(false);
-
-                    if (bodyJson is not null)
-                        bodyJson = JsonSerializer.Deserialize<string>(bodyJson);
-
-                    // Check if the response looks like valid JSON from the API
-                    if (bodyJson is not null && bodyJson.TrimStart().StartsWith('{'))
-                        tcs.TrySetResult(bodyJson);
-                    else
-                        tcs.TrySetResult(null); // Cloudflare challenge page
-                }
-                catch (Exception ex)
-                {
-                    _log($"WebView2 script execution failed: {ex.Message}");
-                    tcs.TrySetResult(null);
-                }
-            }, ct);
+            ExtractBodyAsync(tcs);
         }
 
         _webView!.NavigationCompleted += OnNavigationCompleted;
         try
         {
             _webView.Navigate(url);
-            return await tcs.Task.ConfigureAwait(false);
+            return await tcs.Task;
         }
         finally
         {
@@ -189,9 +215,29 @@ internal sealed partial class WebView2Fetcher : IBepisDbFetcher
         }
     }
 
+    private async void ExtractBodyAsync(TaskCompletionSource<string?> tcs)
+    {
+        try
+        {
+            var bodyJson = await _webView!.ExecuteScriptAsync("document.body.innerText");
+
+            if (bodyJson is not null)
+                bodyJson = JsonSerializer.Deserialize<string>(bodyJson);
+
+            if (bodyJson is not null && bodyJson.TrimStart().StartsWith('{'))
+                tcs.TrySetResult(bodyJson);
+            else
+                tcs.TrySetResult(null);
+        }
+        catch (Exception ex)
+        {
+            _log($"WebView2 script execution failed: {ex.Message}");
+            tcs.TrySetResult(null);
+        }
+    }
+
     private async Task<bool> ShowChallengeWindowAsync(CancellationToken ct)
     {
-        // Make the window visible and sized for captcha interaction
         ShowWindow(_hwnd, SW_SHOW);
         SetWindowText(_hwnd, "BepisDB - Complete Cloudflare Challenge");
         SetWindowPos(_hwnd, IntPtr.Zero, 100, 100, 820, 660, SWP_NOZORDER);
@@ -203,40 +249,19 @@ internal sealed partial class WebView2Fetcher : IBepisDbFetcher
         using var timeout = new CancellationTokenSource(ChallengeTimeout);
         using var timeoutReg = timeout.Token.Register(() => tcs.TrySetResult(false));
 
-        // Navigate to the main page so the user sees the Cloudflare challenge
         _webView!.Navigate(ChallengeUrl);
 
         void OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs args)
         {
             if (!args.IsSuccess) return;
-
-            // Check if we've passed the challenge (URL is no longer a challenge page)
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    var title = await _webView.ExecuteScriptAsync(
-                        "document.title").ConfigureAwait(false);
-                    if (title is not null)
-                        title = JsonSerializer.Deserialize<string>(title);
-
-                    // If the title is "BepisDB" or contains it, challenge passed
-                    if (title is not null && title.Contains("BepisDB", StringComparison.OrdinalIgnoreCase)
-                        && !title.Contains("challenge", StringComparison.OrdinalIgnoreCase))
-                    {
-                        tcs.TrySetResult(true);
-                    }
-                }
-                catch { }
-            }, ct);
+            CheckChallengePassedAsync(tcs);
         }
 
         _webView.NavigationCompleted += OnNavigationCompleted;
         try
         {
-            var result = await tcs.Task.ConfigureAwait(false);
+            var result = await tcs.Task;
 
-            // Hide the window after challenge
             _controller.IsVisible = false;
             ShowWindow(_hwnd, SW_HIDE);
 
@@ -248,14 +273,67 @@ internal sealed partial class WebView2Fetcher : IBepisDbFetcher
         }
     }
 
+    private async void CheckChallengePassedAsync(TaskCompletionSource<bool> tcs)
+    {
+        try
+        {
+            var title = await _webView!.ExecuteScriptAsync("document.title");
+            if (title is not null)
+                title = JsonSerializer.Deserialize<string>(title);
+
+            if (title is not null && title.Contains("BepisDB", StringComparison.OrdinalIgnoreCase)
+                && !title.Contains("challenge", StringComparison.OrdinalIgnoreCase))
+            {
+                tcs.TrySetResult(true);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log($"WebView2 challenge check failed: {ex.Message}");
+        }
+    }
+
     public void Dispose()
     {
-        _controller?.Close();
-        _controller = null;
-        _webView = null;
-        _environment = null;
+        if (_dq is not null)
+        {
+            var tcs = new TaskCompletionSource();
+            if (_dq.TryEnqueue(() =>
+            {
+                _controller?.Close();
+                _controller = null;
+                _webView = null;
+                _environment = null;
+                DestroyHostWindow();
+                tcs.SetResult();
+            }))
+            {
+                tcs.Task.Wait(TimeSpan.FromSeconds(5));
+            }
+            else
+            {
+                _controller?.Close();
+                _controller = null;
+                _webView = null;
+                _environment = null;
+            }
+        }
+        else
+        {
+            _controller?.Close();
+            _controller = null;
+            _webView = null;
+            _environment = null;
+            DestroyHostWindow();
+        }
+
         _initLock.Dispose();
-        DestroyHostWindow();
+
+        if (_dqController is not null)
+        {
+            _dqController.ShutdownQueueAsync().AsTask().Wait(TimeSpan.FromSeconds(5));
+            _dqController = null;
+        }
     }
 
     // -- Win32 window hosting for WebView2 --

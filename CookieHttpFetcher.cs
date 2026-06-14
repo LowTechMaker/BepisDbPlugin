@@ -10,11 +10,17 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
     private readonly HttpClient _http;
     private readonly RateLimiter _rateLimiter;
     private readonly Action<string> _log;
+    private readonly Action _markCookieSetupRequired;
 
-    public CookieHttpFetcher(PluginSettings settings, RateLimiter rateLimiter, Action<string> log)
+    public CookieHttpFetcher(
+        PluginSettings settings,
+        RateLimiter rateLimiter,
+        Action<string> log,
+        Action markCookieSetupRequired)
     {
         _rateLimiter = rateLimiter;
         _log = log;
+        _markCookieSetupRequired = markCookieSetupRequired;
 
         var cookies = new CookieContainer();
         if (settings.CfClearanceCookie is { Length: > 0 } cookie)
@@ -52,8 +58,9 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
 
             if (response.StatusCode == HttpStatusCode.Forbidden)
             {
+                _markCookieSetupRequired();
                 _log("BepisDB API returned 403 Forbidden. Your cf_clearance cookie may have expired. " +
-                     "Update settings.json with a fresh cookie from your browser, or switch to webview2 strategy.");
+                     "Use the cookie setup button on the import page to refresh it.");
                 return null;
             }
 
@@ -63,6 +70,13 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
             response.EnsureSuccessStatusCode();
 
             var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (IsCloudflareChallenge(json))
+            {
+                _markCookieSetupRequired();
+                _log("BepisDB API returned a Cloudflare challenge. Refreshing cookies is required.");
+                return null;
+            }
+
             var apiResponse = JsonSerializer.Deserialize<BepisDbApiResponse>(json);
 
             if (apiResponse?.Type != "success" || apiResponse.Data?.Card is null)
@@ -82,7 +96,46 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
             _log($"BepisDB API request failed for {cardType}_{numericId}: {ex.Message}");
             return null;
         }
+        catch (JsonException ex)
+        {
+            _log($"BepisDB API returned invalid JSON for {cardType}_{numericId}: {ex.Message}");
+            return null;
+        }
     }
+
+    public async Task<bool> HasUsableCookiesAsync(CancellationToken ct)
+    {
+        using var lease = await _rateLimiter.AcquireAsync(ct).ConfigureAwait(false);
+
+        try
+        {
+            var response = await _http.GetAsync($"{ApiBase}?cardType=KKSCENE&id=1", ct).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+            if (response.StatusCode == HttpStatusCode.Forbidden || IsCloudflareChallenge(body))
+            {
+                _markCookieSetupRequired();
+                _log("BepisDB cookie validation hit Cloudflare. Cookie setup is required before import.");
+                return false;
+            }
+
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (HttpRequestException ex)
+        {
+            _log($"BepisDB cookie validation request failed; continuing without forcing setup: {ex.Message}");
+            return true;
+        }
+    }
+
+    private static bool IsCloudflareChallenge(string body) =>
+        body.Contains("cf_chl", StringComparison.OrdinalIgnoreCase)
+        || body.Contains("Just a moment", StringComparison.OrdinalIgnoreCase)
+        || body.Contains("Enable JavaScript and cookies", StringComparison.OrdinalIgnoreCase);
 
     public void Dispose() => _http.Dispose();
 }

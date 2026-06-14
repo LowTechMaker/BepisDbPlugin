@@ -1,16 +1,22 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using SceneGallery.PluginSdk;
+
+[assembly: AssemblyMetadata("PluginDescription", "Imports card metadata from BepisDB (db.bepis.moe)")]
 
 namespace SceneGallery.Plugin.BepisDb;
 
-public sealed class BepisDbPlugin : ICardImportProvider, IDisposable
+public sealed class BepisDbPlugin : ICardImportProvider, IImportDestinationProvider, ICookieSetupValidator, IDisposable
 {
     private static readonly TimeSpan MinRequestInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan MaxJitter = TimeSpan.FromSeconds(5);
 
     private IPluginHost? _host;
+    private PluginSettings? _settings;
+    private RateLimiter? _rateLimiter;
     private IBepisDbFetcher? _fetcher;
     private ArtworkDiskCache? _artworkCache;
+    private bool _cookieSetupRequired;
 
     private readonly ConcurrentDictionary<string, Lazy<Task<ArtworkInfo?>>> _artworkInFlight = new();
     private readonly ConcurrentDictionary<string, ArtworkDiskCache.CachedArtwork> _unsavedArtworkDetails = new();
@@ -21,39 +27,64 @@ public sealed class BepisDbPlugin : ICardImportProvider, IDisposable
 
     public string ProviderId => BepisDbFilenameParser.ProviderId;
 
+    public string DestinationFolderName => "BepisDB";
+
+    public bool UsesRatingFolders => false;
+
+    // ICookieSetupProvider
+    public string SetupUrl => "https://db.bepis.moe/";
+    public string CookieDomain => "db.bepis.moe";
+    public string CompletionTitleHint => "BepisDB";
+    public bool NeedsCookieSetup => _cookieSetupRequired || string.IsNullOrEmpty(_settings?.CfClearanceCookie);
+
+    public void ApplyCookies(IReadOnlyDictionary<string, string> cookies, string userAgent)
+    {
+        if (_host is null || _settings is null) return;
+
+        if (cookies.TryGetValue("cf_clearance", out var clearance))
+        {
+            _settings.CfClearanceCookie = clearance;
+            _cookieSetupRequired = false;
+        }
+        _settings.UserAgent = userAgent;
+        _settings.Save(_host.StorageDirectory, _host.Log);
+
+        _fetcher?.Dispose();
+        _fetcher = CreateCookieFetcher();
+        _host.Log("BepisDB: cookies updated from browser setup.");
+    }
+
     public void Initialize(IPluginHost host)
     {
         _host = host;
         _artworkCache = new ArtworkDiskCache(host.StorageDirectory, host.Log);
-        var settings = PluginSettings.Load(host.StorageDirectory, host.Log);
+        _settings = PluginSettings.Load(host.StorageDirectory, host.Log);
+        _rateLimiter = new RateLimiter(MinRequestInterval, MaxJitter);
 
-        var rateLimiter = new RateLimiter(MinRequestInterval, MaxJitter);
+        if (NeedsCookieSetup)
+            host.Log("BepisDB: no cf_clearance cookie configured. Use the cookie setup button on the import page.");
 
-        if (settings.FetchStrategy.Equals("webview2", StringComparison.OrdinalIgnoreCase))
-        {
-            if (WebView2Fetcher.IsAvailable())
-            {
-                _fetcher = new WebView2Fetcher(host.StorageDirectory, rateLimiter, host.Log);
-                host.Log("BepisDB: using WebView2 fetch strategy.");
-            }
-            else
-            {
-                host.Log("BepisDB: WebView2 runtime not found. Install the WebView2 Evergreen Runtime, " +
-                         "or set fetchStrategy to \"cookie\" in settings.json. Falling back to cookie mode.");
-                _fetcher = new CookieHttpFetcher(settings, rateLimiter, host.Log);
-            }
-        }
-        else
-        {
-            if (string.IsNullOrEmpty(settings.CfClearanceCookie))
-            {
-                host.Log("BepisDB: cookie strategy selected but no cf_clearance cookie configured. " +
-                         "Edit settings.json in the plugin storage directory to add your cookie. " +
-                         "Fetch requests will likely fail with 403.");
-            }
-            _fetcher = new CookieHttpFetcher(settings, rateLimiter, host.Log);
-        }
+        _fetcher = CreateCookieFetcher();
     }
+
+    public async Task<bool> HasUsableCookiesAsync(CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(_settings?.CfClearanceCookie))
+        {
+            _cookieSetupRequired = true;
+            return false;
+        }
+
+        if (_fetcher is not CookieHttpFetcher cookieFetcher)
+            return true;
+
+        var usable = await cookieFetcher.HasUsableCookiesAsync(ct).ConfigureAwait(false);
+        _cookieSetupRequired = !usable;
+        return usable;
+    }
+
+    private CookieHttpFetcher CreateCookieFetcher()
+        => new(_settings!, _rateLimiter!, _host!.Log, () => _cookieSetupRequired = true);
 
     public ArtworkId? TryParseFilename(string fileName)
         => BepisDbFilenameParser.TryParse(fileName);
@@ -174,7 +205,7 @@ public sealed class BepisDbPlugin : ICardImportProvider, IDisposable
 
         return new ArtworkInfo(
             id,
-            entry.UploaderName ?? "Unknown",
+            entry.UploaderName ?? "Anonymous",
             entry.UploaderId ?? "0",
             entry.Title,
             null,
