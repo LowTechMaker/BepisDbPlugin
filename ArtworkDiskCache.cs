@@ -54,6 +54,12 @@ internal sealed class ArtworkDiskCache : IDisposable
         _saveTimer.Change(SaveDebounce, Timeout.InfiniteTimeSpan);
     }
 
+    public CachedArtwork? FindByUploaderId(string uploaderId)
+        => _entries.Values
+            .Where(e => !e.Failed && e.UploaderId == uploaderId && e.UploaderName is not null)
+            .OrderByDescending(e => e.FetchedAt)
+            .FirstOrDefault();
+
     public IReadOnlyList<ArtworkTag>? GetCachedTags(string artworkId)
     {
         if (!_entries.TryGetValue(artworkId, out var entry) || entry.Tags is null)

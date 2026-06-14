@@ -6,7 +6,7 @@ using SceneGallery.PluginSdk;
 
 namespace SceneGallery.Plugin.BepisDb;
 
-public sealed class BepisDbPlugin : ICardImportProvider, IImportDestinationProvider, ICookieSetupValidator, IPluginSettingsProvider, IDisposable
+public sealed class BepisDbPlugin : IFolderAuthorProvider, ICardImportProvider, IImportDestinationProvider, ICookieSetupValidator, IPluginSettingsProvider, IDisposable
 {
     private static readonly TimeSpan MinRequestInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan MaxJitter = TimeSpan.FromSeconds(5);
@@ -116,6 +116,29 @@ public sealed class BepisDbPlugin : ICardImportProvider, IImportDestinationProvi
 
     private CookieHttpFetcher CreateCookieFetcher()
         => new(_settings!, _rateLimiter!, _host!.Log, () => _cookieSetupRequired = true);
+
+    public ParsedAuthor? TryParseFolderName(string folderName)
+        => BepisDbAuthorFolderNameParser.TryParse(folderName);
+
+    public string GetProfileUrl(AuthorKey key)
+        => $"https://db.bepis.moe/user/{key.Id}";
+
+    public Task<AuthorInfo?> GetAuthorInfoAsync(AuthorKey key, bool forceRefresh, CancellationToken ct)
+    {
+        if (_artworkCache is null || key.ProviderId != ProviderId)
+            return Task.FromResult<AuthorInfo?>(null);
+
+        var cached = _artworkCache.FindByUploaderId(key.Id);
+        if (cached is null || cached.UploaderName is null)
+            return Task.FromResult<AuthorInfo?>(null);
+
+        return Task.FromResult<AuthorInfo?>(new AuthorInfo(
+            key,
+            cached.UploaderName,
+            null,
+            GetProfileUrl(key),
+            cached.FetchedAt));
+    }
 
     public ArtworkId? TryParseFilename(string fileName)
         => BepisDbFilenameParser.TryParse(fileName);
