@@ -10,6 +10,31 @@ internal static partial class BepisDbFilenameParser
     [GeneratedRegex(@"(KKSCENE|KKCLOTHING|KK)_(\d+)", RegexOptions.Compiled)]
     private static partial Regex Pattern();
 
+    [GeneratedRegex(@"db\.bepis\.moe/(?<cat>kkscenes|kkclothing|koikatsu)/view/(?<id>\d+)", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    private static partial Regex UrlPattern();
+
+    public static ArtworkId? TryParseUrl(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return null;
+
+        var match = UrlPattern().Match(url);
+        if (!match.Success) return null;
+
+        var category = match.Groups["cat"].Value.ToLowerInvariant() switch
+        {
+            "kkscenes" => "KKSCENE",
+            "kkclothing" => "KKCLOTHING",
+            "koikatsu" => "KK",
+            _ => null,
+        };
+        if (category is null) return null;
+
+        var numericId = match.Groups["id"].Value.TrimStart('0');
+        if (numericId.Length == 0) numericId = "0";
+
+        return new ArtworkId(ProviderId, $"{category}_{numericId}");
+    }
+
     public static ArtworkId? TryParse(string fileName)
     {
         var match = Pattern().Match(fileName);

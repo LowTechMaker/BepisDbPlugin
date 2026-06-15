@@ -143,6 +143,9 @@ public sealed class BepisDbPlugin : IFolderAuthorProvider, ICardImportProvider, 
     public ArtworkId? TryParseFilename(string fileName)
         => BepisDbFilenameParser.TryParse(fileName);
 
+    public ArtworkId? TryParseUrl(string url)
+        => BepisDbFilenameParser.TryParseUrl(url);
+
     public ArtworkId? TryParseArtworkFolderName(string folderName)
         => BepisDbFilenameParser.TryParseFolder(folderName);
 
