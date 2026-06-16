@@ -3,6 +3,7 @@ using System.Reflection;
 using SceneGallery.PluginSdk;
 
 [assembly: AssemblyMetadata("PluginDescription", "Imports card metadata from BepisDB (db.bepis.moe)")]
+[assembly: AssemblyMetadata("PluginUpdateUrl", "https://github.com/LowTechMaker/BepisDbPlugin")]
 
 namespace SceneGallery.Plugin.BepisDb;
 
