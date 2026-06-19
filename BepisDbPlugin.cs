@@ -165,7 +165,7 @@ public sealed class BepisDbPlugin : IFolderAuthorProvider, ICardImportProvider, 
         if (_fetcher is null || _artworkCache is null || id.ProviderId != ProviderId)
             return Task.FromResult<ArtworkInfo?>(null);
 
-        if (_artworkCache.TryGet(id.Id, out var cached) && (cached.Failed || cached.Title != null))
+        if (_artworkCache.TryGet(id.Id, out var cached) && cached.Title != null)
             return Task.FromResult(ToArtworkInfo(id, cached, isSavedLocally: true));
 
         if (saveToLocalCache && _unsavedArtworkDetails.TryRemove(id.Id, out var unsaved))
@@ -198,14 +198,7 @@ public sealed class BepisDbPlugin : IFolderAuthorProvider, ICardImportProvider, 
                 parsed.Value.Category.ToCardType(), parsed.Value.NumericId, ct).ConfigureAwait(false);
 
             if (card is null)
-            {
-                if (saveToLocalCache)
-                {
-                    _artworkCache!.Set(id.Id, new ArtworkDiskCache.CachedArtwork(
-                        null, null, null, null, null, 0, DateTimeOffset.UtcNow, Failed: true));
-                }
                 return null;
-            }
 
             var tags = card.Tags?
                 .Where(t => t.Name is not null)

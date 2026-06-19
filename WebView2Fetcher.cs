@@ -10,6 +10,7 @@ internal sealed partial class WebView2Fetcher : IBepisDbFetcher
     private const string ChallengeUrl = "https://db.bepis.moe/";
     private static readonly TimeSpan NavigationTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan ChallengeTimeout = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan[] RetryDelays = [TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(20)];
 
     private readonly RateLimiter _rateLimiter;
     private readonly Action<string> _log;
@@ -130,57 +131,75 @@ internal sealed partial class WebView2Fetcher : IBepisDbFetcher
 
     public async Task<BepisDbCardData?> FetchCardAsync(string cardType, string numericId, CancellationToken ct)
     {
-        using var lease = await _rateLimiter.AcquireAsync(ct).ConfigureAwait(false);
         var url = $"{ApiBase}?cardType={cardType}&id={numericId}";
 
-        try
+        for (var attempt = 0; ; attempt++)
         {
-            await EnsureInitializedAsync().ConfigureAwait(false);
+            using var lease = await _rateLimiter.AcquireAsync(ct).ConfigureAwait(false);
 
-            if (_webView is null)
+            try
             {
-                _log("WebView2 not initialized.");
-                return null;
-            }
+                await EnsureInitializedAsync().ConfigureAwait(false);
 
-            var json = await RunOnWebViewThread(() => NavigateAndExtractAsync(url, ct)).ConfigureAwait(false);
-
-            if (json is null && !_challengePassed)
-            {
-                _log("Cloudflare challenge detected. Opening browser for captcha...");
-                var passed = await RunOnWebViewThread(() => ShowChallengeWindowAsync(ct)).ConfigureAwait(false);
-                if (passed)
+                if (_webView is null)
                 {
-                    _challengePassed = true;
-                    _log("Cloudflare challenge passed. Retrying API call...");
-                    json = await RunOnWebViewThread(() => NavigateAndExtractAsync(url, ct)).ConfigureAwait(false);
-                }
-                else
-                {
-                    _log("Cloudflare challenge was not completed.");
+                    _log("WebView2 not initialized.");
                     return null;
                 }
+
+                var json = await RunOnWebViewThread(() => NavigateAndExtractAsync(url, ct)).ConfigureAwait(false);
+
+                if (json is null && !_challengePassed)
+                {
+                    _log("Cloudflare challenge detected. Opening browser for captcha...");
+                    var passed = await RunOnWebViewThread(() => ShowChallengeWindowAsync(ct)).ConfigureAwait(false);
+                    if (passed)
+                    {
+                        _challengePassed = true;
+                        _log("Cloudflare challenge passed. Retrying API call...");
+                        json = await RunOnWebViewThread(() => NavigateAndExtractAsync(url, ct)).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        _log("Cloudflare challenge was not completed.");
+                        return null;
+                    }
+                }
+
+                if (json is null)
+                {
+                    if (attempt < RetryDelays.Length)
+                    {
+                        _log($"WebView2 fetch returned no data for {cardType}_{numericId}, retrying in {RetryDelays[attempt].TotalSeconds}s");
+                        await Task.Delay(RetryDelays[attempt], ct).ConfigureAwait(false);
+                        continue;
+                    }
+                    return null;
+                }
+
+                var apiResponse = JsonSerializer.Deserialize<BepisDbApiResponse>(json);
+                if (apiResponse?.Type != "success" || apiResponse.Data?.Card is null)
+                {
+                    _log($"BepisDB API returned unexpected response for {cardType}_{numericId}: {apiResponse?.Error ?? "no card data"}");
+                    return null;
+                }
+
+                return apiResponse.Data.Card;
             }
-
-            if (json is null) return null;
-
-            var apiResponse = JsonSerializer.Deserialize<BepisDbApiResponse>(json);
-            if (apiResponse?.Type != "success" || apiResponse.Data?.Card is null)
+            catch (OperationCanceledException)
             {
-                _log($"BepisDB API returned unexpected response for {cardType}_{numericId}: {apiResponse?.Error ?? "no card data"}");
+                throw;
+            }
+            catch (Exception ex) when (attempt < RetryDelays.Length)
+            {
+                _log($"WebView2 fetch failed for {cardType}_{numericId}: {ex.Message}, retrying in {RetryDelays[attempt].TotalSeconds}s");
+                await Task.Delay(RetryDelays[attempt], ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _log($"WebView2 fetch failed for {cardType}_{numericId}: {ex.Message}");
                 return null;
             }
-
-            return apiResponse.Data.Card;
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _log($"WebView2 fetch failed for {cardType}_{numericId}: {ex.Message}");
-            return null;
         }
     }
 
