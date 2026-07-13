@@ -24,7 +24,17 @@ internal sealed class PluginSettings
             if (File.Exists(path))
             {
                 var json = File.ReadAllText(path);
-                return JsonSerializer.Deserialize<PluginSettings>(json, JsonOptions) ?? new();
+                var document = JsonSerializer.Deserialize<SettingsDocument>(json, JsonOptions) ?? new();
+                return new PluginSettings
+                {
+                    CfClearanceCookie = DpapiSecretProtector.Unprotect(
+                        document.CfClearanceCookie,
+                        "cfClearanceCookie",
+                        log,
+                        out _),
+                    UserAgent = document.UserAgent,
+                    DestinationFolderName = document.DestinationFolderName,
+                };
             }
         }
         catch (Exception ex)
@@ -43,7 +53,13 @@ internal sealed class PluginSettings
         try
         {
             var tempPath = path + ".tmp";
-            File.WriteAllText(tempPath, JsonSerializer.Serialize(this, JsonOptions));
+            var document = new SettingsDocument
+            {
+                CfClearanceCookie = DpapiSecretProtector.Protect(CfClearanceCookie),
+                UserAgent = UserAgent,
+                DestinationFolderName = DestinationFolderName,
+            };
+            File.WriteAllText(tempPath, JsonSerializer.Serialize(document, JsonOptions));
             File.Move(tempPath, path, overwrite: true);
         }
         catch (Exception ex)
@@ -54,4 +70,11 @@ internal sealed class PluginSettings
 
     private static string GetPath(string storageDirectory)
         => Path.Combine(storageDirectory, "settings.json");
+
+    private sealed class SettingsDocument
+    {
+        public string? CfClearanceCookie { get; set; }
+        public string? UserAgent { get; set; }
+        public string DestinationFolderName { get; set; } = "BepisDB";
+    }
 }
