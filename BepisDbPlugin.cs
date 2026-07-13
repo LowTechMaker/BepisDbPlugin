@@ -67,6 +67,18 @@ public sealed class BepisDbPlugin : IFolderAuthorProvider, ICardImportProvider, 
 
     public void Initialize(IPluginHost host)
     {
+        InitializeState(host);
+        _fetcher = CreateCookieFetcher();
+    }
+
+    internal void InitializeForTests(IPluginHost host, IBepisDbFetcher fetcher)
+    {
+        InitializeState(host);
+        _fetcher = fetcher;
+    }
+
+    private void InitializeState(IPluginHost host)
+    {
         _host = host;
         _artworkCache = new ArtworkDiskCache(host.StorageDirectory, host.Log);
         _settings = PluginSettings.Load(host.StorageDirectory, host.Log);
@@ -74,8 +86,6 @@ public sealed class BepisDbPlugin : IFolderAuthorProvider, ICardImportProvider, 
 
         if (NeedsCookieSetup)
             host.Log("BepisDB: no cf_clearance cookie configured. Use the cookie setup button on the import page.");
-
-        _fetcher = CreateCookieFetcher();
     }
 
     public string? GetSettingValue(string key) => key switch
@@ -107,10 +117,13 @@ public sealed class BepisDbPlugin : IFolderAuthorProvider, ICardImportProvider, 
             return false;
         }
 
-        if (_fetcher is not CookieHttpFetcher cookieFetcher)
-            return true;
+        if (_fetcher is null)
+        {
+            _cookieSetupRequired = true;
+            return false;
+        }
 
-        var usable = await cookieFetcher.HasUsableCookiesAsync(ct).ConfigureAwait(false);
+        var usable = await _fetcher.HasUsableCookiesAsync(ct).ConfigureAwait(false);
         _cookieSetupRequired = !usable;
         return usable;
     }
@@ -124,8 +137,14 @@ public sealed class BepisDbPlugin : IFolderAuthorProvider, ICardImportProvider, 
     public string GetProfileUrl(AuthorKey key)
         => $"https://db.bepis.moe/user/{key.Id}";
 
+    /// <summary>
+    /// Returns author information derived from the artwork cache. BepisDB has no
+    /// independent author refresh source, so <paramref name="forceRefresh"/> is currently ignored.
+    /// </summary>
     public Task<AuthorInfo?> GetAuthorInfoAsync(AuthorKey key, bool forceRefresh, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
+
         if (_artworkCache is null || key.ProviderId != ProviderId)
             return Task.FromResult<AuthorInfo?>(null);
 
@@ -176,8 +195,8 @@ public sealed class BepisDbPlugin : IFolderAuthorProvider, ICardImportProvider, 
 
         var inFlightKey = $"{id.Id}:{saveToLocalCache}";
         var lazy = _artworkInFlight.GetOrAdd(inFlightKey, _ => new Lazy<Task<ArtworkInfo?>>(
-            () => FetchArtworkAsync(id, saveToLocalCache, ct)));
-        return lazy.Value;
+            () => FetchArtworkAsync(id, saveToLocalCache, CancellationToken.None)));
+        return lazy.Value.WaitAsync(ct);
     }
 
     private async Task<ArtworkInfo?> FetchArtworkAsync(

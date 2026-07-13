@@ -12,30 +12,30 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
     private readonly RateLimiter _rateLimiter;
     private readonly Action<string> _log;
     private readonly Action _markCookieSetupRequired;
+    private readonly IReadOnlyList<TimeSpan> _retryDelays;
 
     public CookieHttpFetcher(
         PluginSettings settings,
         RateLimiter rateLimiter,
         Action<string> log,
         Action markCookieSetupRequired)
+        : this(settings, rateLimiter, log, markCookieSetupRequired, CreateHandler(settings))
+    {
+    }
+
+    internal CookieHttpFetcher(
+        PluginSettings settings,
+        RateLimiter rateLimiter,
+        Action<string> log,
+        Action markCookieSetupRequired,
+        HttpMessageHandler handler,
+        IReadOnlyList<TimeSpan>? retryDelays = null)
     {
         _rateLimiter = rateLimiter;
         _log = log;
         _markCookieSetupRequired = markCookieSetupRequired;
-
-        var cookies = new CookieContainer();
-        if (settings.CfClearanceCookie is { Length: > 0 } cookie)
-        {
-            cookies.Add(new Cookie("cf_clearance", cookie, "/", "db.bepis.moe"));
-        }
-
-        var handler = new SocketsHttpHandler
-        {
-            CookieContainer = cookies,
-            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
-        };
-
-        _http = new HttpClient(handler)
+        _retryDelays = retryDelays ?? RetryDelays;
+        _http = new HttpClient(handler, disposeHandler: true)
         {
             Timeout = TimeSpan.FromSeconds(30),
         };
@@ -48,6 +48,19 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
         _http.DefaultRequestHeaders.Add("Referer", "https://db.bepis.moe/");
     }
 
+    private static HttpMessageHandler CreateHandler(PluginSettings settings)
+    {
+        var cookies = new CookieContainer();
+        if (settings.CfClearanceCookie is { Length: > 0 } cookie)
+            cookies.Add(new Cookie("cf_clearance", cookie, "/", "db.bepis.moe"));
+
+        return new SocketsHttpHandler
+        {
+            CookieContainer = cookies,
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
+        };
+    }
+
     public async Task<BepisDbCardData?> FetchCardAsync(string cardType, string numericId, CancellationToken ct)
     {
         var url = $"{ApiBase}?cardType={cardType}&id={numericId}";
@@ -58,32 +71,44 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
 
             try
             {
-                var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
-
-                if (response.StatusCode == HttpStatusCode.Forbidden)
-                {
-                    _markCookieSetupRequired();
-                    _log("BepisDB API returned 403 Forbidden. Your cf_clearance cookie may have expired. " +
-                         "Use the cookie setup button on the import page to refresh it.");
-                    return null;
-                }
+                using var response = await _http.GetAsync(url, ct).ConfigureAwait(false);
 
                 if (response.StatusCode == HttpStatusCode.NotFound)
                     return null;
 
                 var transient = response.StatusCode == HttpStatusCode.TooManyRequests
                                 || (int)response.StatusCode >= 500;
-                if (transient && attempt < RetryDelays.Length)
+                if (transient)
                 {
-                    _log($"BepisDB API returned {(int)response.StatusCode} for {cardType}_{numericId}, retrying in {RetryDelays[attempt].TotalSeconds}s");
-                    response.Dispose();
-                    await Task.Delay(RetryDelays[attempt], ct).ConfigureAwait(false);
-                    continue;
+                    if (attempt < _retryDelays.Count)
+                    {
+                        _log($"BepisDB API returned {(int)response.StatusCode} for {cardType}_{numericId}, retrying in {_retryDelays[attempt].TotalSeconds}s");
+                        response.Dispose();
+                        await Task.Delay(_retryDelays[attempt], ct).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    _log($"BepisDB API returned {(int)response.StatusCode} for {cardType}_{numericId} after retries were exhausted.");
+                    return null;
                 }
 
-                response.EnsureSuccessStatusCode();
-
                 var json = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+                // Cloudflare is an authentication/setup state rather than a
+                // resource, schema, or transient API result, so it stays on its
+                // dedicated cookie-setup path.
+                if (response.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    HandleForbidden($"API request for {cardType}_{numericId}", json);
+                    return null;
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    LogSchemaError(cardType, numericId, $"HTTP {(int)response.StatusCode}", json);
+                    return null;
+                }
+
                 if (IsCloudflareChallenge(json))
                 {
                     _markCookieSetupRequired();
@@ -91,33 +116,54 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
                     return null;
                 }
 
-                var apiResponse = JsonSerializer.Deserialize<BepisDbApiResponse>(json);
-
-                if (apiResponse?.Type != "success" || apiResponse.Data?.Card is null)
+                BepisDbApiResponse? apiResponse;
+                try
                 {
-                    _log($"BepisDB API returned unexpected response for {cardType}_{numericId}: {apiResponse?.Error ?? "no card data"}");
+                    apiResponse = JsonSerializer.Deserialize<BepisDbApiResponse>(json);
+                }
+                catch (JsonException ex)
+                {
+                    LogSchemaError(cardType, numericId, $"invalid JSON: {ex.Message}", json);
                     return null;
                 }
 
-                return apiResponse.Data.Card;
+                if (apiResponse?.Type != "success" || apiResponse.Data?.Card is null)
+                {
+                    LogSchemaError(cardType, numericId, apiResponse?.Error ?? "no card data", json);
+                    return null;
+                }
+
+                var card = apiResponse.Data.Card;
+                if (card.Id <= 0 || string.IsNullOrWhiteSpace(card.CardType))
+                {
+                    LogSchemaError(cardType, numericId, "card is missing id or cardType", json);
+                    return null;
+                }
+
+                return card;
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 throw;
             }
-            catch (HttpRequestException ex) when (attempt < RetryDelays.Length)
+            catch (OperationCanceledException ex) when (attempt < _retryDelays.Count)
             {
-                _log($"BepisDB API request failed for {cardType}_{numericId}: {ex.Message}, retrying in {RetryDelays[attempt].TotalSeconds}s");
-                await Task.Delay(RetryDelays[attempt], ct).ConfigureAwait(false);
+                _log($"BepisDB API request timed out for {cardType}_{numericId}: {ex.Message}, retrying in {_retryDelays[attempt].TotalSeconds}s");
+                await Task.Delay(_retryDelays[attempt], ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException ex)
+            {
+                _log($"BepisDB API request timed out for {cardType}_{numericId}: {ex.Message}");
+                return null;
+            }
+            catch (HttpRequestException ex) when (attempt < _retryDelays.Count)
+            {
+                _log($"BepisDB API request failed for {cardType}_{numericId}: {ex.Message}, retrying in {_retryDelays[attempt].TotalSeconds}s");
+                await Task.Delay(_retryDelays[attempt], ct).ConfigureAwait(false);
             }
             catch (HttpRequestException ex)
             {
                 _log($"BepisDB API request failed for {cardType}_{numericId}: {ex.Message}");
-                return null;
-            }
-            catch (JsonException ex)
-            {
-                _log($"BepisDB API returned invalid JSON for {cardType}_{numericId}: {ex.Message}");
                 return null;
             }
         }
@@ -129,27 +175,64 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
 
         try
         {
-            var response = await _http.GetAsync($"{ApiBase}?cardType=KKSCENE&id=1", ct).ConfigureAwait(false);
+            using var response = await _http.GetAsync($"{ApiBase}?cardType=KKSCENE&id=1", ct).ConfigureAwait(false);
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
-            if (response.StatusCode == HttpStatusCode.Forbidden || IsCloudflareChallenge(body))
+            if (response.StatusCode == HttpStatusCode.Forbidden)
+            {
+                HandleForbidden("cookie validation", body);
+                return false;
+            }
+
+            if (IsCloudflareChallenge(body))
             {
                 _markCookieSetupRequired();
                 _log("BepisDB cookie validation hit Cloudflare. Cookie setup is required before import.");
                 return false;
             }
 
-            return true;
+            if (response.IsSuccessStatusCode)
+                return true;
+
+            _log($"BepisDB cookie validation could not confirm cookie usability: HTTP {(int)response.StatusCode}.");
+            return false;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             throw;
         }
+        catch (OperationCanceledException ex)
+        {
+            _log($"BepisDB cookie validation timed out; cookie is treated as unavailable: {ex.Message}");
+            return false;
+        }
         catch (HttpRequestException ex)
         {
-            _log($"BepisDB cookie validation request failed; continuing without forcing setup: {ex.Message}");
-            return true;
+            _log($"BepisDB cookie validation request failed; cookie is treated as unavailable: {ex.Message}");
+            return false;
         }
+    }
+
+    private void HandleForbidden(string context, string body)
+    {
+        _markCookieSetupRequired();
+        if (IsCloudflareChallenge(body))
+        {
+            _log($"BepisDB {context} returned 403 with a confirmed Cloudflare challenge. Cookie setup is required.");
+        }
+        else
+        {
+            _log($"BepisDB {context} returned 403 without Cloudflare challenge markers. Cookie setup is required; the response may indicate permissions or blocking.");
+        }
+    }
+
+    private void LogSchemaError(string cardType, string numericId, string reason, string responseBody)
+    {
+        const int maxSummaryLength = 500;
+        var summary = responseBody.Length <= maxSummaryLength
+            ? responseBody
+            : responseBody[..maxSummaryLength];
+        _log($"warning: BepisDB schema error for {cardType}_{numericId} ({reason}); response: {summary}");
     }
 
     private static bool IsCloudflareChallenge(string body) =>
