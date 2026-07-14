@@ -11,18 +11,9 @@
     <DefaultItemExcludes>$(DefaultItemExcludes);SceneGallery.Plugin.BepisDb.Tests\**</DefaultItemExcludes>
   </PropertyGroup>
 
-  <ItemGroup Condition="Exists('$(SceneGalleryAppDir)\PluginSdk\SceneGallery.PluginSdk.csproj')">
-    <ProjectReference Include="$(SceneGalleryAppDir)\PluginSdk\SceneGallery.PluginSdk.csproj" Private="false" />
-  </ItemGroup>
-
-  <ItemGroup Condition="!Exists('$(SceneGalleryAppDir)\PluginSdk\SceneGallery.PluginSdk.csproj')">
-    <Reference Include="SceneGallery.PluginSdk" Private="false">
-      <HintPath>lib\SceneGallery.PluginSdk.dll</HintPath>
-    </Reference>
-  </ItemGroup>
-
   <ItemGroup>
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.9" />
+    <PackageReference Include="SceneGallery.PluginSdk" Version="1.0.0" ExcludeAssets="runtime" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>
