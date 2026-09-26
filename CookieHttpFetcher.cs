@@ -1,5 +1,4 @@
 using System.Net;
-using System.Text.Json;
 
 namespace SceneGallery.Plugin.BepisDb;
 
@@ -109,38 +108,20 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
                     return null;
                 }
 
-                if (IsCloudflareChallenge(json))
+                if (BepisDbResponseParser.IsCloudflareChallenge(json))
                 {
                     _markCookieSetupRequired();
                     _log("BepisDB API returned a Cloudflare challenge. Refreshing cookies is required.");
                     return null;
                 }
 
-                BepisDbApiResponse? apiResponse;
-                try
+                var parsed = BepisDbResponseParser.ParseCard(json);
+                if (parsed.SchemaError is { } error)
                 {
-                    apiResponse = JsonSerializer.Deserialize<BepisDbApiResponse>(json);
-                }
-                catch (JsonException ex)
-                {
-                    LogSchemaError(cardType, numericId, $"invalid JSON: {ex.Message}", json);
+                    LogSchemaError(cardType, numericId, error, json);
                     return null;
                 }
-
-                if (apiResponse?.Type != "success" || apiResponse.Data?.Card is null)
-                {
-                    LogSchemaError(cardType, numericId, apiResponse?.Error ?? "no card data", json);
-                    return null;
-                }
-
-                var card = apiResponse.Data.Card;
-                if (card.Id <= 0 || string.IsNullOrWhiteSpace(card.CardType))
-                {
-                    LogSchemaError(cardType, numericId, "card is missing id or cardType", json);
-                    return null;
-                }
-
-                return card;
+                return parsed.Card;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -184,7 +165,7 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
                 return false;
             }
 
-            if (IsCloudflareChallenge(body))
+            if (BepisDbResponseParser.IsCloudflareChallenge(body))
             {
                 _markCookieSetupRequired();
                 _log("BepisDB cookie validation hit Cloudflare. Cookie setup is required before import.");
@@ -216,7 +197,7 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
     private void HandleForbidden(string context, string body)
     {
         _markCookieSetupRequired();
-        if (IsCloudflareChallenge(body))
+        if (BepisDbResponseParser.IsCloudflareChallenge(body))
         {
             _log($"BepisDB {context} returned 403 with a confirmed Cloudflare challenge. Cookie setup is required.");
         }
@@ -234,11 +215,6 @@ internal sealed class CookieHttpFetcher : IBepisDbFetcher
             : responseBody[..maxSummaryLength];
         _log($"warning: BepisDB schema error for {cardType}_{numericId} ({reason}); response: {summary}");
     }
-
-    private static bool IsCloudflareChallenge(string body) =>
-        body.Contains("cf_chl", StringComparison.OrdinalIgnoreCase)
-        || body.Contains("Just a moment", StringComparison.OrdinalIgnoreCase)
-        || body.Contains("Enable JavaScript and cookies", StringComparison.OrdinalIgnoreCase);
 
     public void Dispose() => _http.Dispose();
 }

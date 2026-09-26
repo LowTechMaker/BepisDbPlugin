@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Reflection;
 using SceneGallery.PluginSdk;
 
@@ -7,287 +6,97 @@ using SceneGallery.PluginSdk;
 
 namespace SceneGallery.Plugin.BepisDb;
 
+/// <summary>SDK capability adapter. Runtime ownership and provider policy live below this boundary.</summary>
 public sealed class BepisDbPlugin : IFolderAuthorProvider, ICardImportProvider, IImportDestinationProvider, ICookieSetupValidator, IPluginSettingsProvider, IDisposable
 {
-    private static readonly TimeSpan MinRequestInterval = TimeSpan.FromSeconds(3);
-    private static readonly TimeSpan MaxJitter = TimeSpan.FromSeconds(5);
-
-    private IPluginHost? _host;
-    private PluginSettings? _settings;
-    private RateLimiter? _rateLimiter;
-    private IBepisDbFetcher? _fetcher;
-    private ArtworkDiskCache? _artworkCache;
-    private bool _cookieSetupRequired;
-
-    private readonly ConcurrentDictionary<string, Lazy<Task<ArtworkInfo?>>> _artworkInFlight = new();
-    private readonly ConcurrentDictionary<string, ArtworkDiskCache.CachedArtwork> _unsavedArtworkDetails = new();
+    private BepisDbRuntime? _runtime;
+    private readonly object _initializationGate = new();
+    private bool _disposed;
 
     public string Name => "BepisDB";
-
     public string Version => typeof(BepisDbPlugin).Assembly.GetName().Version?.ToString(3) ?? "1.0.0";
-
     public string ProviderId => BepisDbFilenameParser.ProviderId;
-
-    public string DestinationFolderName => _settings?.DestinationFolderName ?? "BepisDB";
-
+    public string DestinationFolderName => _runtime?.DestinationFolderName ?? "BepisDB";
     public bool UsesRatingFolders => false;
-
     public IReadOnlyList<PluginSettingDefinition> Settings { get; } =
     [
-        new(
-            "destinationFolderName",
-            "Destination folder",
+        new("destinationFolderName", "Destination folder",
             "Folder inserted below the organized import subfolder. Leave empty to skip the provider folder.",
-            PluginSettingValueType.Text,
-            "BepisDB"),
+            PluginSettingValueType.Text, "BepisDB"),
     ];
 
-    // ICookieSetupProvider
     public string SetupUrl => "https://db.bepis.moe/";
     public string CookieDomain => "db.bepis.moe";
     public string CompletionTitleHint => "BepisDB";
-    public bool NeedsCookieSetup => _cookieSetupRequired || string.IsNullOrEmpty(_settings?.CfClearanceCookie);
+    public bool NeedsCookieSetup => _runtime?.NeedsCookieSetup ?? true;
 
-    public void ApplyCookies(IReadOnlyDictionary<string, string> cookies, string userAgent)
-    {
-        if (_host is null || _settings is null) return;
-
-        if (cookies.TryGetValue("cf_clearance", out var clearance))
-        {
-            _settings.CfClearanceCookie = clearance;
-            _cookieSetupRequired = false;
-        }
-        _settings.UserAgent = userAgent;
-        _settings.Save(_host.StorageDirectory, _host.Log);
-
-        _fetcher?.Dispose();
-        _fetcher = CreateCookieFetcher();
-        _host.Log("BepisDB: cookies updated from browser setup.");
-    }
-
-    public void Initialize(IPluginHost host)
-    {
-        InitializeState(host);
-        _fetcher = CreateCookieFetcher();
-    }
+    public void Initialize(IPluginHost host) => InitializeRuntime(() => new BepisDbRuntime(host));
 
     internal void InitializeForTests(IPluginHost host, IBepisDbFetcher fetcher)
+        => InitializeForTests(host, (_, _) => fetcher);
+
+    internal void InitializeForTests(IPluginHost host,
+        Func<PluginSettings, Action, IBepisDbFetcher> fetcherFactory, TimeSpan? disposeTimeout = null)
+        => InitializeRuntime(() => new BepisDbRuntime(host, fetcherFactory, disposeTimeout));
+
+    private void InitializeRuntime(Func<BepisDbRuntime> createRuntime)
     {
-        InitializeState(host);
-        _fetcher = fetcher;
-    }
-
-    private void InitializeState(IPluginHost host)
-    {
-        _host = host;
-        _artworkCache = new ArtworkDiskCache(host.StorageDirectory, host.Log);
-        _settings = PluginSettings.Load(host.StorageDirectory, host.Log);
-        _rateLimiter = new RateLimiter(MinRequestInterval, MaxJitter);
-
-        if (NeedsCookieSetup)
-            host.Log("BepisDB: no cf_clearance cookie configured. Use the cookie setup button on the import page.");
-    }
-
-    public string? GetSettingValue(string key) => key switch
-    {
-        "destinationFolderName" => DestinationFolderName,
-        _ => null,
-    };
-
-    public void SetSettingValue(string key, string? value)
-    {
-        if (_host is null || _settings is null)
-            return;
-
-        switch (key)
+        lock (_initializationGate)
         {
-            case "destinationFolderName":
-                _settings.DestinationFolderName = value?.Trim() ?? "";
-                break;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_runtime is not null)
+                throw new InvalidOperationException("BepisDB is already initialized.");
+            _runtime = createRuntime();
         }
-
-        _settings.Save(_host.StorageDirectory, _host.Log);
     }
 
-    public async Task<bool> HasUsableCookiesAsync(CancellationToken ct)
+    public void ApplyCookies(IReadOnlyDictionary<string, string> cookies, string userAgent)
+        => GetRuntime()?.ApplyCookies(cookies, userAgent);
+
+    public string? GetSettingValue(string key)
     {
-        if (string.IsNullOrEmpty(_settings?.CfClearanceCookie))
-        {
-            _cookieSetupRequired = true;
-            return false;
-        }
-
-        if (_fetcher is null)
-        {
-            _cookieSetupRequired = true;
-            return false;
-        }
-
-        var usable = await _fetcher.HasUsableCookiesAsync(ct).ConfigureAwait(false);
-        _cookieSetupRequired = !usable;
-        return usable;
+        var runtime = GetRuntime();
+        return key == "destinationFolderName" ? runtime?.DestinationFolderName ?? "BepisDB" : null;
     }
+    public void SetSettingValue(string key, string? value) => GetRuntime()?.SetSettingValue(key, value);
+    public Task<bool> HasUsableCookiesAsync(CancellationToken ct)
+        => GetRuntime()?.HasUsableCookiesAsync(ct) ?? Task.FromResult(false);
 
-    private CookieHttpFetcher CreateCookieFetcher()
-        => new(_settings!, _rateLimiter!, _host!.Log, () => _cookieSetupRequired = true);
+    public ParsedAuthor? TryParseFolderName(string folderName) => BepisDbAuthorFolderNameParser.TryParse(folderName);
+    public string GetProfileUrl(AuthorKey key) => BepisDbCardMapper.GetProfileUrl(key);
 
-    public ParsedAuthor? TryParseFolderName(string folderName)
-        => BepisDbAuthorFolderNameParser.TryParse(folderName);
-
-    public string GetProfileUrl(AuthorKey key)
-        => $"https://db.bepis.moe/user/{key.Id}";
-
-    /// <summary>
-    /// Returns author information derived from the artwork cache. BepisDB has no
-    /// independent author refresh source, so <paramref name="forceRefresh"/> is currently ignored.
-    /// </summary>
+    /// <summary>BepisDB authors come from artwork metadata; there is no independent author refresh API.</summary>
     public Task<AuthorInfo?> GetAuthorInfoAsync(AuthorKey key, bool forceRefresh, CancellationToken ct)
     {
+        var runtime = GetRuntime();
         ct.ThrowIfCancellationRequested();
-
-        if (_artworkCache is null || key.ProviderId != ProviderId)
-            return Task.FromResult<AuthorInfo?>(null);
-
-        var cached = _artworkCache.FindByUploaderId(key.Id);
-        if (cached is null || cached.UploaderName is null)
-            return Task.FromResult<AuthorInfo?>(null);
-
-        return Task.FromResult<AuthorInfo?>(new AuthorInfo(
-            key,
-            cached.UploaderName,
-            null,
-            GetProfileUrl(key),
-            cached.FetchedAt));
+        return runtime?.GetAuthorInfoAsync(key, ct) ?? Task.FromResult<AuthorInfo?>(null);
     }
 
-    public ArtworkId? TryParseFilename(string fileName)
-        => BepisDbFilenameParser.TryParse(fileName);
+    public ArtworkId? TryParseFilename(string fileName) => BepisDbFilenameParser.TryParse(fileName);
+    public ArtworkId? TryParseUrl(string url) => BepisDbFilenameParser.TryParseUrl(url);
+    public ArtworkId? TryParseArtworkFolderName(string folderName) => BepisDbFilenameParser.TryParseFolder(folderName);
+    public string GetArtworkUrl(ArtworkId id) => BepisDbCardMapper.GetArtworkUrl(id);
+    public Task<ArtworkInfo?> FetchArtworkInfoAsync(ArtworkId id, CancellationToken ct, bool saveToLocalCache = true)
+        => GetRuntime()?.FetchArtworkInfoAsync(id, ct, saveToLocalCache) ?? Task.FromResult<ArtworkInfo?>(null);
 
-    public ArtworkId? TryParseUrl(string url)
-        => BepisDbFilenameParser.TryParseUrl(url);
-
-    public ArtworkId? TryParseArtworkFolderName(string folderName)
-        => BepisDbFilenameParser.TryParseFolder(folderName);
-
-    public string GetArtworkUrl(ArtworkId id)
+    private BepisDbRuntime? GetRuntime()
     {
-        var parsed = BepisDbCategoryHelper.ParseCompositeId(id.Id);
-        if (parsed is null) return $"https://db.bepis.moe/koikatsu/view/{id.Id}";
-        return $"https://db.bepis.moe/{parsed.Value.Category.ToUrlSegment()}/view/{parsed.Value.NumericId}";
-    }
-
-    public Task<ArtworkInfo?> FetchArtworkInfoAsync(
-        ArtworkId id,
-        CancellationToken ct,
-        bool saveToLocalCache = true)
-    {
-        if (_fetcher is null || _artworkCache is null || id.ProviderId != ProviderId)
-            return Task.FromResult<ArtworkInfo?>(null);
-
-        if (_artworkCache.TryGet(id.Id, out var cached) && cached.Title != null)
-            return Task.FromResult(ToArtworkInfo(id, cached, isSavedLocally: true));
-
-        if (saveToLocalCache && _unsavedArtworkDetails.TryRemove(id.Id, out var unsaved))
+        lock (_initializationGate)
         {
-            _artworkCache.Set(id.Id, unsaved);
-            return Task.FromResult(ToArtworkInfo(id, unsaved, isSavedLocally: true));
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _runtime;
         }
-
-        var inFlightKey = $"{id.Id}:{saveToLocalCache}";
-        var lazy = _artworkInFlight.GetOrAdd(inFlightKey, _ => new Lazy<Task<ArtworkInfo?>>(
-            () => FetchArtworkAsync(id, saveToLocalCache, CancellationToken.None)));
-        return lazy.Value.WaitAsync(ct);
-    }
-
-    private async Task<ArtworkInfo?> FetchArtworkAsync(
-        ArtworkId id,
-        bool saveToLocalCache,
-        CancellationToken ct)
-    {
-        try
-        {
-            var parsed = BepisDbCategoryHelper.ParseCompositeId(id.Id);
-            if (parsed is null)
-            {
-                _host?.Log($"Cannot parse composite ID: {id.Id}");
-                return null;
-            }
-
-            var card = await _fetcher!.FetchCardAsync(
-                parsed.Value.Category.ToCardType(), parsed.Value.NumericId, ct).ConfigureAwait(false);
-
-            if (card is null)
-                return null;
-
-            var tags = card.Tags?
-                .Where(t => t.Name is not null)
-                .Select(t => new ArtworkDiskCache.CachedTag(t.Name!))
-                .ToList();
-
-            var entry = new ArtworkDiskCache.CachedArtwork(
-                card.Uploader?.Username,
-                card.Uploader?.Id.ToString(),
-                card.CustomName,
-                card.CardType,
-                tags,
-                card.DownloadCount,
-                DateTimeOffset.UtcNow,
-                Failed: false);
-
-            if (saveToLocalCache)
-            {
-                _artworkCache!.Set(id.Id, entry);
-                _unsavedArtworkDetails.TryRemove(id.Id, out _);
-            }
-            else
-            {
-                _unsavedArtworkDetails[id.Id] = entry;
-            }
-
-            return ToArtworkInfo(id, entry, saveToLocalCache);
-        }
-        catch (OperationCanceledException)
-        {
-            return null;
-        }
-        catch (Exception ex)
-        {
-            _host?.Log($"fetch failed for BepisDB artwork {id.Id}: {ex.Message}");
-            return null;
-        }
-        finally
-        {
-            _artworkInFlight.TryRemove($"{id.Id}:{saveToLocalCache}", out _);
-        }
-    }
-
-    private static ArtworkInfo? ToArtworkInfo(
-        ArtworkId id,
-        ArtworkDiskCache.CachedArtwork entry,
-        bool isSavedLocally)
-    {
-        if (entry.Failed) return null;
-
-        var tags = entry.Tags?
-            .Select(t => new ArtworkTag(t.Name, null))
-            .ToList() as IReadOnlyList<ArtworkTag>
-            ?? [];
-
-        return new ArtworkInfo(
-            id,
-            entry.UploaderName ?? "Anonymous",
-            entry.UploaderId ?? "0",
-            entry.Title,
-            null,
-            ContentRating.AllAges,
-            tags,
-            entry.FetchedAt,
-            isSavedLocally);
     }
 
     public void Dispose()
     {
-        _artworkCache?.Dispose();
-        _fetcher?.Dispose();
+        BepisDbRuntime? runtime;
+        lock (_initializationGate)
+        {
+            _disposed = true;
+            runtime = _runtime;
+        }
+        runtime?.Dispose();
     }
 }
