@@ -62,3 +62,9 @@ rtk proxy pwsh -NoProfile -File ./eng/Verify-Plugin.ps1 -NuGetConfig ../Koikatsu
 ## 2026-09-27 發布候選驗證
 
 遠端既有最新 release/tag 為 `0.0.4`；本次候選版為 `v0.0.5`。以正式注入版本 `0.0.5`、SDK `1.3.0`、Common/Secrets `0.2.0` 及明確的本機 NuGet feed 執行 `eng/Verify-Plugin.ps1`，**102/102 通過**，並通過組件／套件邊界、發佈輸出及文件連結檢查。測試輸出位於此 checkout 的 `bin/release-validation/artifacts`（Git 忽略）。編譯採 `UseSharedCompilation=false` 避免沙箱外的 Roslyn shared compiler 無法寫入隔離輸出；`NuGetAudit=false` 僅用於無法連線 nuget.org 的本機環境，不代表已完成遠端套件安全稽核。這項驗證使用本機套件來源，官方 GitHub Packages 還原及遠端 Release workflow 須在依賴套件發佈後另行確認。
+
+## 2026-09-27 遠端發版結果
+
+- 來源 commit `781bc35e6e69dbd06fa89d24bc1dc34d8a0db7b3` 已快進至 `master`；[Build CI](https://github.com/LowTechMaker/BepisDbPlugin/actions/runs/36270003931) 在 repo 正式 NuGet.config／GitHub Packages 設定下通過完整 gate。標註式 tag `v0.0.5` 指向該 commit；[Release CI](https://github.com/LowTechMaker/BepisDbPlugin/actions/runs/36270117793) 的驗證、打包與發佈步驟均通過。
+- [GitHub Release v0.0.5](https://github.com/LowTechMaker/BepisDbPlugin/releases/tag/v0.0.5) 提供 `SceneGallery.Plugin.BepisDb-0.0.5.dll`；下載後 SHA256 為 `00f046a03e63e3a4c750ae53c6ac2e85717a6cc34924fb36333f0dfa56686d30`，符合 GitHub asset digest，組件版本為 `0.0.5.0`。以公開宿主 v0.4.0 正式 ZIP 內的 SDK DLL 做獨立載入測試，plugin type 與所有介面均可解析。
+- 本段遠端結果記錄於 tag 發佈後的文件提交；tag 仍指向已由 Release CI 驗證的來源。真實 BepisDB／Cloudflare 登入及宿主 UI 行為仍屬前節列出的人工驗證範圍。
